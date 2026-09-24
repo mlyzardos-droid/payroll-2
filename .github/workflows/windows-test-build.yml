@@ -41,6 +41,6 @@ jobs:
           name: PrometheusPayroll-Windows-test
           path: |
             dist/PrometheusPayroll.exe
-            dist/PrometheusPayroll-Setup-1.1.0.exe
+            dist/PrometheusPayroll-Setup-1.1.1.exe
           if-no-files-found: error
           retention-days: 14

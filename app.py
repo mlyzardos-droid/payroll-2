@@ -12,12 +12,13 @@ from reportlab.pdfgen import canvas
 
 import matplotlib.pyplot as plt
 
-from PySide6.QtCore import QDate
+from PySide6.QtCore import QDate, Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QListWidget, QLineEdit, QMessageBox, QComboBox, QTableWidget,
-    QTableWidgetItem, QFileDialog, QDateEdit, QCheckBox, QTabWidget
+    QTableWidgetItem, QFileDialog, QDateEdit, QCheckBox, QTabWidget,
+    QScrollArea, QHeaderView, QSizePolicy, QGridLayout, QSplitter
 )
 
 
@@ -53,6 +54,16 @@ DEFAULT_SETTINGS = {
 }
 
 
+class ResponsiveSplitter(QSplitter):
+    """Keep the classic layout usable by stacking panels on narrow windows."""
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        desired = Qt.Horizontal if event.size().width() >= 1180 else Qt.Vertical
+        if self.orientation() != desired:
+            self.setOrientation(desired)
+
+
 class PayrollApp(QWidget):
     def __init__(self):
         super().__init__()
@@ -62,8 +73,18 @@ class PayrollApp(QWidget):
         self.last_deleted_employee = None
         self.last_edit_snapshot = None
 
-        self.setWindowTitle("Prometheus Payroll v1.1.0 — Hourly Payroll Edition")
-        self.resize(1700, 950)
+        self.setWindowTitle("Prometheus Payroll v1.1.1 — Hourly Payroll Edition")
+        screen = QApplication.primaryScreen()
+        available = screen.availableGeometry() if screen else None
+        available_width = available.width() if available else 1440
+        available_height = available.height() if available else 900
+        minimum_width = max(320, min(720, available_width - 32))
+        minimum_height = max(280, min(540, available_height - 48))
+        self.setMinimumSize(minimum_width, minimum_height)
+        self.resize(
+            max(minimum_width, min(1280, available_width - 32)),
+            max(minimum_height, min(820, available_height - 48)),
+        )
 
         self.conn = sqlite3.connect(DB_NAME)
         self.cursor = self.conn.cursor()
@@ -144,17 +165,22 @@ class PayrollApp(QWidget):
         tabs = QTabWidget()
         self.tabs = tabs
 
-        self.employees_tab = QWidget()
-        self.attendance_tab = QWidget()
-        self.payroll_tab = QWidget()
-        self.reports_tab = QWidget()
-        self.settings_tab = QWidget()
+        def add_scrollable_tab(title):
+            page = QWidget()
+            page.setMinimumWidth(0)
+            area = QScrollArea()
+            area.setWidgetResizable(True)
+            area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            area.setWidget(page)
+            tabs.addTab(area, title)
+            return page
 
-        tabs.addTab(self.employees_tab, "Employees")
-        tabs.addTab(self.attendance_tab, "Attendance")
-        tabs.addTab(self.payroll_tab, "Payroll")
-        tabs.addTab(self.reports_tab, "Reports")
-        tabs.addTab(self.settings_tab, "Settings")
+        self.employees_tab = add_scrollable_tab("Employees")
+        self.attendance_tab = add_scrollable_tab("Attendance")
+        self.payroll_tab = add_scrollable_tab("Payroll")
+        self.reports_tab = add_scrollable_tab("Reports")
+        self.settings_tab = add_scrollable_tab("Settings")
 
         self.build_employees_ui(self.employees_tab)
         self.build_attendance_ui(self.attendance_tab)
@@ -165,37 +191,50 @@ class PayrollApp(QWidget):
         return tabs
 
     def build_classic_view(self):
-        main = QHBoxLayout()
+        main = QVBoxLayout()
+        splitter = ResponsiveSplitter(Qt.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.setHandleWidth(8)
 
-        left = QVBoxLayout()
-        middle = QVBoxLayout()
-        right = QVBoxLayout()
+        def make_panel(builders):
+            content = QWidget()
+            content.setMinimumWidth(0)
+            panel_layout = QVBoxLayout(content)
+            panel_layout.setContentsMargins(6, 6, 6, 6)
+            panel_layout.setSpacing(12)
+            for builder in builders:
+                section = QWidget()
+                section.setMinimumWidth(0)
+                builder(section)
+                panel_layout.addWidget(section)
 
-        employee_box = QWidget()
-        attendance_box = QWidget()
-        payroll_box = QWidget()
-        reports_box = QWidget()
-        settings_box = QWidget()
+            area = QScrollArea()
+            area.setWidgetResizable(True)
+            area.setMinimumWidth(0)
+            area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+            area.setWidget(content)
+            splitter.addWidget(area)
 
-        self.build_employees_ui(employee_box)
-        self.build_attendance_ui(attendance_box)
-        self.build_payroll_ui(payroll_box)
-        self.build_reports_ui(reports_box)
-        self.build_settings_ui(settings_box)
+        make_panel([self.build_employees_ui, self.build_attendance_ui])
+        make_panel([self.build_payroll_ui, self.build_settings_ui])
+        make_panel([self.build_reports_ui])
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        splitter.setStretchFactor(2, 2)
 
-        left.addWidget(employee_box)
-        left.addWidget(attendance_box)
-
-        middle.addWidget(payroll_box)
-        middle.addWidget(settings_box)
-
-        right.addWidget(reports_box)
-
-        main.addLayout(left, 1)
-        main.addLayout(middle, 1)
-        main.addLayout(right, 2)
-
+        main.addWidget(splitter)
         return main
+
+    @staticmethod
+    def configure_responsive_table(table):
+        table.setMinimumWidth(0)
+        table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        table.setWordWrap(False)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        table.horizontalHeader().setStretchLastSection(True)
 
     def build_employees_ui(self, parent):
         layout = QVBoxLayout()
@@ -257,7 +296,9 @@ class PayrollApp(QWidget):
         self.break_input.setPlaceholderText("Διάλειμμα σε λεπτά")
         layout.addWidget(self.break_input)
 
-        layout.addWidget(QLabel("Το διάλειμμα αφαιρείται από τις πραγματικές ώρες εργασίας."))
+        break_note = QLabel("Το διάλειμμα αφαιρείται από τις πραγματικές ώρες εργασίας.")
+        break_note.setWordWrap(True)
+        layout.addWidget(break_note)
 
         self.save_btn = QPushButton("Αποθήκευση Ωρών")
         self.save_btn.clicked.connect(self.save_attendance)
@@ -317,6 +358,8 @@ class PayrollApp(QWidget):
             "Υπάλληλος", "Πραγματικές Ώρες", "Πληρωμένες Ώρες",
             "Υπόλοιπο Ωρών", "Σύνολο Μισθοδοσίας", "Πληρωμένο Ποσό", "Οφειλόμενο Ποσό"
         ])
+        self.configure_responsive_table(self.employee_summary_table)
+        self.employee_summary_table.setMinimumHeight(180)
         layout.addWidget(self.employee_summary_table)
 
         layout.addWidget(QLabel("Μηνιαία μισθοδοσία"))
@@ -372,21 +415,28 @@ class PayrollApp(QWidget):
             "ID", "Υπάλληλος", "Ημερομηνία", "Προσέλευση", "Αποχώρηση",
             "Διάλειμμα (λεπτά)", "Πραγματικές Ώρες"
         ])
+        self.configure_responsive_table(self.history_table)
+        self.history_table.setMinimumHeight(220)
         layout.addWidget(self.history_table)
 
-        buttons = QHBoxLayout()
+        buttons = QGridLayout()
+        buttons.setHorizontalSpacing(8)
+        buttons.setVerticalSpacing(8)
 
-        for text, action in [
+        for index, (text, action) in enumerate([
             ("Επεξεργασία", self.load_selected_record_for_edit),
             ("Διαγραφή", self.delete_selected_record),
             ("Export Excel", self.export_to_excel),
             ("Export PDF", self.export_to_pdf),
             ("Backup Database", self.backup_database),
             ("Charts", self.create_charts),
-        ]:
+        ]):
             btn = QPushButton(text)
             btn.clicked.connect(action)
-            buttons.addWidget(btn)
+            btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            buttons.addWidget(btn, index // 3, index % 3)
+        for column in range(3):
+            buttons.setColumnStretch(column, 1)
 
         layout.addLayout(buttons)
         employee_export_btn = QPushButton("Εξαγωγή Παρουσιών & Πληρωμών Υπαλλήλου (Excel)")
@@ -397,7 +447,7 @@ class PayrollApp(QWidget):
     def build_settings_ui(self, parent):
         layout = QVBoxLayout()
 
-        layout.addWidget(QLabel("Prometheus Payroll v1.1.0 — Hourly Payroll Edition"))
+        layout.addWidget(QLabel("Prometheus Payroll v1.1.1 — Hourly Payroll Edition"))
         layout.addWidget(QLabel("Ρυθμίσεις Εμφάνισης"))
 
         layout.addWidget(QLabel("Theme"))
@@ -420,7 +470,9 @@ class PayrollApp(QWidget):
         save_btn.clicked.connect(self.save_ui_settings)
         layout.addWidget(save_btn)
 
-        layout.addWidget(QLabel("Σημείωση: οι αλλαγές σε theme/view εφαρμόζονται αφού κλείσεις και ξανανοίξεις την εφαρμογή."))
+        settings_note = QLabel("Σημείωση: οι αλλαγές σε theme/view εφαρμόζονται αφού κλείσεις και ξανανοίξεις την εφαρμογή.")
+        settings_note.setWordWrap(True)
+        layout.addWidget(settings_note)
 
         parent.setLayout(layout)
 

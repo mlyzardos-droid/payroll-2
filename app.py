@@ -3,6 +3,7 @@ import os
 import json
 import shutil
 import sqlite3
+import re
 from datetime import datetime
 from openpyxl import Workbook
 
@@ -20,8 +21,30 @@ from PySide6.QtWidgets import (
 )
 
 
-DB_NAME = "payroll.db"
-SETTINGS_FILE = "settings.json"
+if sys.platform == "win32":
+    APP_DATA_ROOT = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+else:
+    APP_DATA_ROOT = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
+
+APP_DATA_DIR = os.path.join(APP_DATA_ROOT, "PrometheusPayroll")
+
+os.makedirs(APP_DATA_DIR, exist_ok=True)
+
+DB_NAME = os.path.join(APP_DATA_DIR, "payroll.db")
+SETTINGS_FILE = os.path.join(APP_DATA_DIR, "settings.json")
+
+
+def migrate_legacy_user_files():
+    """Copy legacy working-directory data only when the new user database is absent."""
+    legacy_db = os.path.join(os.path.dirname(os.path.abspath(__file__)), "payroll.db")
+    if not os.path.exists(DB_NAME) and os.path.isfile(legacy_db) and os.path.abspath(legacy_db) != os.path.abspath(DB_NAME):
+        shutil.copy2(legacy_db, DB_NAME)
+    legacy_settings = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+    if not os.path.exists(SETTINGS_FILE) and os.path.isfile(legacy_settings) and os.path.abspath(legacy_settings) != os.path.abspath(SETTINGS_FILE):
+        shutil.copy2(legacy_settings, SETTINGS_FILE)
+
+
+migrate_legacy_user_files()
 
 
 DEFAULT_SETTINGS = {
@@ -36,13 +59,15 @@ class PayrollApp(QWidget):
 
         self.settings = self.load_settings()
         self.editing_record_id = None
+        self.last_deleted_employee = None
+        self.last_edit_snapshot = None
 
-        self.setWindowTitle("Payroll Manager")
+        self.setWindowTitle("Prometheus Payroll v1.1.0 — Hourly Payroll Edition")
         self.resize(1700, 950)
 
         self.conn = sqlite3.connect(DB_NAME)
         self.cursor = self.conn.cursor()
-        self.create_tables()
+        self.migration_summary = self.create_tables()
 
         self.apply_theme()
 
@@ -57,6 +82,9 @@ class PayrollApp(QWidget):
 
         self.load_employees()
         self.load_history()
+        self.load_monthly_summary()
+        if self.migration_summary:
+            QMessageBox.information(self, "Ολοκληρώθηκε η ενημέρωση", self.migration_summary)
 
     def load_settings(self):
         if not os.path.exists(SETTINGS_FILE):
@@ -114,6 +142,7 @@ class PayrollApp(QWidget):
 
     def build_tabs_view(self):
         tabs = QTabWidget()
+        self.tabs = tabs
 
         self.employees_tab = QWidget()
         self.attendance_tab = QWidget()
@@ -177,16 +206,29 @@ class PayrollApp(QWidget):
         self.employee_input.setPlaceholderText("Όνομα υπαλλήλου")
         layout.addWidget(self.employee_input)
 
+        self.employee_hourly_rate_input = QLineEdit()
+        self.employee_hourly_rate_input.setPlaceholderText("Βασικό ωρομίσθιο (€), π.χ. 7 ή 7,50")
+        layout.addWidget(self.employee_hourly_rate_input)
+
         add_btn = QPushButton("Προσθήκη Υπαλλήλου")
         add_btn.clicked.connect(self.add_employee)
         layout.addWidget(add_btn)
 
+        self.employee_rate_save_btn = QPushButton("Επεξεργασία / Αποθήκευση Ωρομισθίου")
+        self.employee_rate_save_btn.clicked.connect(self.save_employee_hourly_rate)
+        layout.addWidget(self.employee_rate_save_btn)
+
         self.employee_list = QListWidget()
+        self.employee_list.currentItemChanged.connect(self.load_selected_employee_rate)
         layout.addWidget(self.employee_list)
 
         remove_btn = QPushButton("Αφαίρεση Υπαλλήλου")
         remove_btn.clicked.connect(self.remove_employee)
         layout.addWidget(remove_btn)
+
+        undo_remove_btn = QPushButton("Αναίρεση Διαγραφής Υπαλλήλου")
+        undo_remove_btn.clicked.connect(self.undo_delete_employee)
+        layout.addWidget(undo_remove_btn)
 
         parent.setLayout(layout)
 
@@ -215,23 +257,7 @@ class PayrollApp(QWidget):
         self.break_input.setPlaceholderText("Διάλειμμα σε λεπτά")
         layout.addWidget(self.break_input)
 
-        self.paid_hours_input = QLineEdit()
-        self.paid_hours_input.setPlaceholderText("Πληρωμένες ώρες")
-        layout.addWidget(self.paid_hours_input)
-
-        self.unpaid_overtime_amount_input = QLineEdit()
-        self.unpaid_overtime_amount_input.setPlaceholderText("Ποσό απλήρωτων υπερωριών")
-        layout.addWidget(self.unpaid_overtime_amount_input)
-
-        self.unpaid_overtime_paid_checkbox = QCheckBox("Οι υπερωρίες πληρώθηκαν")
-        layout.addWidget(self.unpaid_overtime_paid_checkbox)
-
-        layout.addWidget(QLabel("Ημερομηνία πληρωμής υπερωριών"))
-
-        self.payment_date_input = QDateEdit()
-        self.payment_date_input.setCalendarPopup(True)
-        self.payment_date_input.setDate(QDate.currentDate())
-        layout.addWidget(self.payment_date_input)
+        layout.addWidget(QLabel("Το διάλειμμα αφαιρείται από τις πραγματικές ώρες εργασίας."))
 
         self.save_btn = QPushButton("Αποθήκευση Ωρών")
         self.save_btn.clicked.connect(self.save_attendance)
@@ -240,6 +266,10 @@ class PayrollApp(QWidget):
         cancel_btn = QPushButton("Ακύρωση Επεξεργασίας")
         cancel_btn.clicked.connect(self.cancel_edit)
         layout.addWidget(cancel_btn)
+
+        undo_edit_btn = QPushButton("Αναίρεση Τελευταίας Αλλαγής Μισθοδοσίας")
+        undo_edit_btn.clicked.connect(self.undo_last_edit)
+        layout.addWidget(undo_edit_btn)
 
         self.result_label = QLabel("")
         layout.addWidget(self.result_label)
@@ -252,32 +282,26 @@ class PayrollApp(QWidget):
         layout.addWidget(QLabel("Φίλτρα Payroll"))
 
         self.employee_search_input = QLineEdit()
-        self.employee_search_input.setPlaceholderText("Search υπαλλήλου")
+        self.employee_search_input.setPlaceholderText("Αναζήτηση υπαλλήλου")
         self.employee_search_input.textChanged.connect(self.load_history)
         layout.addWidget(self.employee_search_input)
 
         self.filter_employee_select = QComboBox()
+        self.filter_employee_select.currentIndexChanged.connect(self.sync_monthly_from_payroll_filters)
         layout.addWidget(self.filter_employee_select)
-
-        self.overtime_payment_filter = QComboBox()
-        self.overtime_payment_filter.addItem("Όλες οι υπερωρίες", "all")
-        self.overtime_payment_filter.addItem("Μόνο πληρωμένες υπερωρίες", "paid")
-        self.overtime_payment_filter.addItem("Μόνο απλήρωτες υπερωρίες", "unpaid")
-        self.overtime_payment_filter.currentIndexChanged.connect(self.load_history)
-        layout.addWidget(self.overtime_payment_filter)
 
         layout.addWidget(QLabel("Από ημερομηνία"))
         self.from_date_input = QDateEdit()
         self.from_date_input.setCalendarPopup(True)
         self.from_date_input.setDate(QDate.currentDate().addMonths(-1))
-        self.from_date_input.dateChanged.connect(self.load_history)
+        self.from_date_input.dateChanged.connect(self.sync_monthly_from_payroll_filters)
         layout.addWidget(self.from_date_input)
 
         layout.addWidget(QLabel("Έως ημερομηνία"))
         self.to_date_input = QDateEdit()
         self.to_date_input.setCalendarPopup(True)
         self.to_date_input.setDate(QDate.currentDate())
-        self.to_date_input.dateChanged.connect(self.load_history)
+        self.to_date_input.dateChanged.connect(self.sync_monthly_from_payroll_filters)
         layout.addWidget(self.to_date_input)
 
         clear_btn = QPushButton("Καθαρισμός Φίλτρων")
@@ -288,12 +312,52 @@ class PayrollApp(QWidget):
         layout.addWidget(self.summary_label)
 
         self.employee_summary_table = QTableWidget()
-        self.employee_summary_table.setColumnCount(6)
+        self.employee_summary_table.setColumnCount(7)
         self.employee_summary_table.setHorizontalHeaderLabels([
-            "Υπάλληλος", "Σύνολο Ωρών", "Πληρωμένες",
-            "Απλήρωτες", "Υπερωρίες", "Οφειλόμενο Ποσό"
+            "Υπάλληλος", "Πραγματικές Ώρες", "Πληρωμένες Ώρες",
+            "Υπόλοιπο Ωρών", "Σύνολο Μισθοδοσίας", "Πληρωμένο Ποσό", "Οφειλόμενο Ποσό"
         ])
         layout.addWidget(self.employee_summary_table)
+
+        layout.addWidget(QLabel("Μηνιαία μισθοδοσία"))
+        self.monthly_employee_select = QComboBox()
+        layout.addWidget(self.monthly_employee_select)
+        monthly_period = QHBoxLayout()
+        self.monthly_month_select = QComboBox()
+        for month in range(1, 13):
+            self.monthly_month_select.addItem(
+                ("Ιανουάριος", "Φεβρουάριος", "Μάρτιος", "Απρίλιος", "Μάιος", "Ιούνιος",
+                 "Ιούλιος", "Αύγουστος", "Σεπτέμβριος", "Οκτώβριος", "Νοέμβριος", "Δεκέμβριος")[month - 1],
+                month,
+            )
+        self.monthly_year_input = QLineEdit(str(QDate.currentDate().year()))
+        self.monthly_year_input.setPlaceholderText("Έτος")
+        monthly_period.addWidget(self.monthly_month_select)
+        monthly_period.addWidget(self.monthly_year_input)
+        layout.addLayout(monthly_period)
+        self.monthly_paid_hours_input = QLineEdit()
+        self.monthly_paid_hours_input.setPlaceholderText("Ώρες που έχουν ήδη πληρωθεί")
+        layout.addWidget(self.monthly_paid_hours_input)
+        self.monthly_hourly_rate_input = QLineEdit()
+        self.monthly_hourly_rate_input.setPlaceholderText("Ωρομίσθιο (€)")
+        layout.addWidget(self.monthly_hourly_rate_input)
+        self.new_payment_amount_input = QLineEdit()
+        self.new_payment_amount_input.setPlaceholderText("Πληρωμή τώρα (€), π.χ. 50 ή 50,00")
+        layout.addWidget(self.new_payment_amount_input)
+        add_payment_btn = QPushButton("Καταχώριση Πληρωμής")
+        add_payment_btn.clicked.connect(self.add_monthly_payment)
+        layout.addWidget(add_payment_btn)
+        monthly_save = QPushButton("Αποθήκευση Μηνιαίας Μισθοδοσίας")
+        monthly_save.clicked.connect(self.save_monthly_payroll)
+        layout.addWidget(monthly_save)
+        monthly_refresh = QPushButton("Προβολή Επιλεγμένου Μήνα")
+        monthly_refresh.clicked.connect(self.load_monthly_summary)
+        layout.addWidget(monthly_refresh)
+        self.monthly_month_select.currentIndexChanged.connect(self.refresh_monthly_views)
+        self.monthly_year_input.textChanged.connect(self.refresh_monthly_views)
+        self.monthly_employee_select.currentIndexChanged.connect(self.refresh_monthly_views)
+        self.monthly_summary_label = QLabel("")
+        layout.addWidget(self.monthly_summary_label)
 
         parent.setLayout(layout)
 
@@ -303,11 +367,10 @@ class PayrollApp(QWidget):
         self.history_table = QTableWidget()
         self.history_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.history_table.setSelectionMode(QTableWidget.SingleSelection)
-        self.history_table.setColumnCount(12)
+        self.history_table.setColumnCount(7)
         self.history_table.setHorizontalHeaderLabels([
             "ID", "Υπάλληλος", "Ημερομηνία", "Προσέλευση", "Αποχώρηση",
-            "Σύνολο", "Πληρωμένες", "Απλήρωτες", "Υπερωρίες",
-            "Ποσό Υπερωριών", "Πληρώθηκε;", "Ημ/νία Πληρωμής"
+            "Διάλειμμα (λεπτά)", "Πραγματικές Ώρες"
         ])
         layout.addWidget(self.history_table)
 
@@ -316,8 +379,6 @@ class PayrollApp(QWidget):
         for text, action in [
             ("Επεξεργασία", self.load_selected_record_for_edit),
             ("Διαγραφή", self.delete_selected_record),
-            ("Σήμανση Πληρωμένη", self.mark_selected_as_paid),
-            ("Σήμανση Απλήρωτη", self.mark_selected_as_unpaid),
             ("Export Excel", self.export_to_excel),
             ("Export PDF", self.export_to_pdf),
             ("Backup Database", self.backup_database),
@@ -328,11 +389,15 @@ class PayrollApp(QWidget):
             buttons.addWidget(btn)
 
         layout.addLayout(buttons)
+        employee_export_btn = QPushButton("Εξαγωγή Παρουσιών & Πληρωμών Υπαλλήλου (Excel)")
+        employee_export_btn.clicked.connect(self.export_employee_payroll_to_excel)
+        layout.addWidget(employee_export_btn)
         parent.setLayout(layout)
 
     def build_settings_ui(self, parent):
         layout = QVBoxLayout()
 
+        layout.addWidget(QLabel("Prometheus Payroll v1.1.0 — Hourly Payroll Edition"))
         layout.addWidget(QLabel("Ρυθμίσεις Εμφάνισης"))
 
         layout.addWidget(QLabel("Theme"))
@@ -390,17 +455,119 @@ class PayrollApp(QWidget):
                 paid_hours REAL,
                 unpaid_hours REAL,
                 overtime_hours REAL,
+                unpaid_overtime_rate REAL DEFAULT 0,
                 unpaid_overtime_amount REAL DEFAULT 0,
                 unpaid_overtime_paid INTEGER DEFAULT 0,
                 overtime_payment_date TEXT
             )
         """)
 
-        self.add_column_if_missing("attendance", "unpaid_overtime_amount", "REAL DEFAULT 0")
-        self.add_column_if_missing("attendance", "unpaid_overtime_paid", "INTEGER DEFAULT 0")
-        self.add_column_if_missing("attendance", "overtime_payment_date", "TEXT")
-
         self.conn.commit()
+        columns = self.table_columns("attendance")
+        required = {"unpaid_overtime_amount", "unpaid_overtime_paid", "overtime_payment_date", "overtime_hours", "unpaid_overtime_rate"}
+        employee_columns = self.table_columns("employees")
+        employee_rate_missing = "hourly_rate" not in employee_columns
+        monthly_exists = self.cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='monthly_payments'"
+        ).fetchone() is not None
+        payments_exists = self.cursor.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='payroll_payments'"
+        ).fetchone() is not None
+        current_version = self.get_schema_version()
+        if required.issubset(columns) and monthly_exists and payments_exists and not employee_rate_missing and current_version >= 4:
+            return ""
+
+        backup_path = self.create_pre_migration_backup()
+        changed_rows = malformed_rows = 0
+        recalculate_history = current_version < 2
+        self.cursor.execute("BEGIN IMMEDIATE")
+        try:
+            if employee_rate_missing:
+                self.cursor.execute("ALTER TABLE employees ADD COLUMN hourly_rate REAL NOT NULL DEFAULT 0")
+            for name, definition in [
+                ("unpaid_overtime_amount", "REAL DEFAULT 0"),
+                ("unpaid_overtime_paid", "INTEGER DEFAULT 0"),
+                ("overtime_payment_date", "TEXT"),
+                ("overtime_hours", "REAL DEFAULT 0"),
+                ("unpaid_overtime_rate", "REAL DEFAULT 0"),
+            ]:
+                if name not in self.table_columns("attendance"):
+                    self.cursor.execute(f"ALTER TABLE attendance ADD COLUMN {name} {definition}")
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS monthly_payments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    employee_id INTEGER NOT NULL,
+                    year INTEGER NOT NULL,
+                    month INTEGER NOT NULL,
+                    paid_hours REAL NOT NULL DEFAULT 0,
+                    hourly_rate REAL NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(employee_id, year, month),
+                    FOREIGN KEY(employee_id) REFERENCES employees(id)
+                )
+            """)
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS payroll_payments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    employee_id INTEGER NOT NULL,
+                    year INTEGER NOT NULL,
+                    month INTEGER NOT NULL,
+                    amount REAL NOT NULL CHECK(amount > 0),
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(employee_id) REFERENCES employees(id)
+                )
+            """)
+            if recalculate_history:
+                rows = self.cursor.execute("SELECT id, date, check_in, check_out, break_minutes FROM attendance").fetchall()
+                for row_id, date_value, check_in, check_out, break_minutes in rows:
+                    try:
+                        start = datetime.strptime(self.normalize_time(check_in or ""), "%H:%M")
+                        end = datetime.strptime(self.normalize_time(check_out or ""), "%H:%M")
+                        if end <= start:
+                            from datetime import timedelta
+                            end += timedelta(days=1)
+                        actual = (end - start).total_seconds() / 3600 - int(break_minutes or 0) / 60
+                        parsed_date = datetime.strptime(str(date_value), "%Y-%m-%d") if "-" in str(date_value) else datetime.strptime(str(date_value), "%Y/%m/%d")
+                        if actual < 0:
+                            raise ValueError
+                    except (ValueError, TypeError):
+                        malformed_rows += 1
+                        continue
+                    self.cursor.execute(
+                        "UPDATE attendance SET date=?, total_hours=?, unpaid_hours=MAX(0, ? - COALESCE(paid_hours, 0)), overtime_hours=0 WHERE id=?",
+                        (parsed_date.strftime("%Y-%m-%d"), actual, actual, row_id),
+                    )
+                    changed_rows += 1
+            self.cursor.execute("PRAGMA user_version = 4")
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            raise
+        migration_details = (
+            f"Επαναϋπολογίστηκαν {changed_rows} παρουσίες και παραλείφθηκαν {malformed_rows} μη έγκυρες εγγραφές."
+            if recalculate_history else "Το ιστορικό παρουσιών διατηρήθηκε ανέπαφο."
+        )
+        return f"Η βάση ενημερώθηκε. Αντίγραφο ασφαλείας: {backup_path}\n{migration_details}"
+
+    def table_columns(self, table_name):
+        self.cursor.execute(f"PRAGMA table_info({table_name})")
+        return {column[1] for column in self.cursor.fetchall()}
+
+    def get_schema_version(self):
+        return self.cursor.execute("PRAGMA user_version").fetchone()[0]
+
+    def create_pre_migration_backup(self):
+        os.makedirs(APP_DATA_DIR, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = os.path.join(APP_DATA_DIR, f"payroll_backup_before_v1_1_0_{timestamp}.db")
+        self.conn.commit()
+        destination = sqlite3.connect(backup_path)
+        try:
+            self.conn.backup(destination)
+        finally:
+            destination.close()
+        return backup_path
 
     def add_column_if_missing(self, table_name, column_name, column_type):
         self.cursor.execute(f"PRAGMA table_info({table_name})")
@@ -411,38 +578,92 @@ class PayrollApp(QWidget):
 
     def normalize_time(self, value):
         value = value.strip()
-        if ":" in value:
-            return value
-        if value.isdigit():
-            return f"{int(value):02d}:00"
-        raise ValueError
+        match = re.fullmatch(r"(\d{1,2})(?::(\d{1,2}))?", value)
+        if not match:
+            raise ValueError
+        hour, minute = int(match.group(1)), int(match.group(2) or 0)
+        if hour > 23 or minute > 59:
+            raise ValueError
+        return f"{hour:02d}:{minute:02d}"
+
+    def parse_number(self, value):
+        value = value.strip().replace(",", ".")
+        if value == "":
+            return 0
+        return float(value)
 
     def load_employees(self):
         current_filter_id = self.filter_employee_select.currentData() if self.filter_employee_select.count() > 0 else None
+        current_monthly_id = self.monthly_employee_select.currentData() if hasattr(self, "monthly_employee_select") else None
 
         self.employee_list.clear()
         self.employee_select.clear()
+        if hasattr(self, "monthly_employee_select"):
+            self.monthly_employee_select.clear()
 
         self.filter_employee_select.blockSignals(True)
         self.filter_employee_select.clear()
         self.filter_employee_select.addItem("Όλοι οι υπάλληλοι", None)
 
-        self.cursor.execute("SELECT id, name FROM employees ORDER BY name")
+        self.cursor.execute("SELECT id, name, hourly_rate FROM employees ORDER BY name")
         employees = self.cursor.fetchall()
 
         selected_index = 0
+        monthly_selected_index = 0
 
-        for employee_id, name in employees:
-            self.employee_list.addItem(name)
+        for employee_id, name, hourly_rate in employees:
+            self.employee_list.addItem(f"{name} — {float(hourly_rate or 0):.2f} €/ώρα")
+            self.employee_list.item(self.employee_list.count() - 1).setData(32, employee_id)
+            self.employee_list.item(self.employee_list.count() - 1).setToolTip(f"Ωρομίσθιο: {float(hourly_rate or 0):.2f} €")
             self.employee_select.addItem(name, employee_id)
             self.filter_employee_select.addItem(name, employee_id)
-
+            if hasattr(self, "monthly_employee_select"):
+                self.monthly_employee_select.addItem(name, employee_id)
+                if employee_id == current_monthly_id:
+                    monthly_selected_index = self.monthly_employee_select.count() - 1
             if current_filter_id == employee_id:
                 selected_index = self.filter_employee_select.count() - 1
 
+        if self.employee_list.count() > 0 and self.employee_list.currentRow() < 0:
+            self.employee_list.setCurrentRow(0)
+
         self.filter_employee_select.setCurrentIndex(selected_index)
         self.filter_employee_select.blockSignals(False)
-        self.filter_employee_select.currentIndexChanged.connect(self.load_history)
+        if hasattr(self, "monthly_employee_select"):
+            self.monthly_employee_select.blockSignals(True)
+            self.monthly_employee_select.setCurrentIndex(monthly_selected_index)
+            self.monthly_employee_select.blockSignals(False)
+        self.sync_monthly_from_payroll_filters()
+
+    def load_selected_employee_rate(self, item, _previous=None):
+        if item is None:
+            self.employee_hourly_rate_input.clear()
+            return
+        row = self.cursor.execute(
+            "SELECT hourly_rate FROM employees WHERE id=?", (item.data(32),)
+        ).fetchone()
+        self.employee_hourly_rate_input.setText(str(float(row[0] or 0)) if row else "0")
+
+    def save_employee_hourly_rate(self):
+        item = self.employee_list.currentItem()
+        if item is None:
+            QMessageBox.warning(self, "Σφάλμα", "Επίλεξε υπάλληλο για να αποθηκεύσεις το ωρομίσθιο.")
+            return
+        try:
+            hourly_rate = self.parse_number(self.employee_hourly_rate_input.text())
+            if hourly_rate < 0:
+                raise ValueError
+        except ValueError:
+            QMessageBox.warning(self, "Σφάλμα", "Μη έγκυρο ωρομίσθιο. Χρησιμοποίησε αριθμό όπως 7, 7.5 ή 7,5.")
+            return
+        employee_id = item.data(32)
+        employee_name = item.text().split(" — ", 1)[0]
+        self.cursor.execute("UPDATE employees SET hourly_rate=? WHERE id=?", (hourly_rate, employee_id))
+        self.conn.commit()
+        self.load_employees()
+        self.load_monthly_summary()
+        self.load_history()
+        QMessageBox.information(self, "Αποθηκεύτηκε", f"Ωρομίσθιο {hourly_rate:.2f} € αποθηκεύτηκε για τον/την {employee_name}.")
 
     def add_employee(self):
         name = self.employee_input.text().strip()
@@ -451,10 +672,19 @@ class PayrollApp(QWidget):
             QMessageBox.warning(self, "Σφάλμα", "Δώσε όνομα υπαλλήλου")
             return
 
-        self.cursor.execute("INSERT INTO employees (name) VALUES (?)", (name,))
+        try:
+            hourly_rate = self.parse_number(self.employee_hourly_rate_input.text())
+            if hourly_rate < 0:
+                raise ValueError
+        except ValueError:
+            QMessageBox.warning(self, "Σφάλμα", "Μη έγκυρο ωρομίσθιο. Χρησιμοποίησε αριθμό όπως 7, 7.5 ή 7,5.")
+            return
+
+        self.cursor.execute("INSERT INTO employees (name, hourly_rate) VALUES (?, ?)", (name, hourly_rate))
         self.conn.commit()
 
         self.employee_input.clear()
+        self.employee_hourly_rate_input.clear()
         self.load_employees()
         self.load_history()
 
@@ -465,52 +695,119 @@ class PayrollApp(QWidget):
             QMessageBox.warning(self, "Σφάλμα", "Επίλεξε υπάλληλο")
             return
 
-        name = selected_item.text()
+        employee_id = selected_item.data(32)
+        self.cursor.execute("SELECT id, name, hourly_rate FROM employees WHERE id = ?", (employee_id,))
+        employee = self.cursor.fetchone()
 
-        confirm = QMessageBox.question(self, "Επιβεβαίωση", f"Να αφαιρεθεί ο υπάλληλος {name};")
+        if employee is None:
+            QMessageBox.warning(self, "Σφάλμα", "Δεν βρέθηκε ο υπάλληλος")
+            return
+
+        employee_id, employee_name, hourly_rate = employee
+
+        self.cursor.execute("SELECT COUNT(*) FROM attendance WHERE employee_id = ?", (employee_id,))
+        attendance_count = self.cursor.fetchone()[0]
+
+        if attendance_count > 0:
+            QMessageBox.warning(
+                self,
+                "Δεν επιτρέπεται",
+                "Ο υπάλληλος έχει καταχωρήσεις μισθοδοσίας. Δεν διαγράφεται για να μη χαθεί ιστορικό."
+            )
+            return
+
+        confirm = QMessageBox.question(self, "Επιβεβαίωση", f"Να αφαιρεθεί ο υπάλληλος {employee_name};")
 
         if confirm != QMessageBox.Yes:
             return
 
-        self.cursor.execute("DELETE FROM employees WHERE name = ?", (name,))
+        self.last_deleted_employee = {
+            "id": employee_id,
+            "name": employee_name,
+            "hourly_rate": hourly_rate,
+        }
+
+        self.cursor.execute("DELETE FROM employees WHERE id = ?", (employee_id,))
         self.conn.commit()
 
         self.load_employees()
         self.load_history()
 
+        QMessageBox.information(
+            self,
+            "Διαγράφηκε",
+            "Ο υπάλληλος διαγράφηκε. Μπορείς να πατήσεις Αναίρεση Διαγραφής Υπαλλήλου."
+        )
+
+    def undo_delete_employee(self):
+        if not self.last_deleted_employee:
+            QMessageBox.information(self, "Αναίρεση", "Δεν υπάρχει πρόσφατη διαγραφή υπαλλήλου για αναίρεση.")
+            return
+
+        employee_id = self.last_deleted_employee["id"]
+        employee_name = self.last_deleted_employee["name"]
+
+        self.cursor.execute("SELECT id FROM employees WHERE id = ?", (employee_id,))
+        existing = self.cursor.fetchone()
+
+        if existing:
+            QMessageBox.warning(self, "Σφάλμα", "Ο υπάλληλος υπάρχει ήδη στη βάση.")
+            self.last_deleted_employee = None
+            return
+
+        self.cursor.execute(
+            "INSERT INTO employees (id, name, hourly_rate) VALUES (?, ?, ?)",
+            (employee_id, employee_name, self.last_deleted_employee.get("hourly_rate", 0))
+        )
+        self.conn.commit()
+
+        self.last_deleted_employee = None
+        self.load_employees()
+        self.load_history()
+
+        QMessageBox.information(self, "Αναίρεση", f"Ο υπάλληλος {employee_name} επανήλθε.")
+
     def calculate_attendance_values(self):
         check_in_text = self.check_in_input.text().strip()
         check_out_text = self.check_out_input.text().strip()
         break_text = self.break_input.text().strip()
-        paid_text = self.paid_hours_input.text().strip()
-        amount_text = self.unpaid_overtime_amount_input.text().strip()
 
         if check_in_text == "" or check_out_text == "":
-            raise ValueError
+            raise ValueError("missing_time")
 
-        check_in = self.normalize_time(check_in_text)
-        check_out = self.normalize_time(check_out_text)
+        try:
+            check_in = self.normalize_time(check_in_text)
+            check_out = self.normalize_time(check_out_text)
+            start = datetime.strptime(check_in, "%H:%M")
+            end = datetime.strptime(check_out, "%H:%M")
+        except Exception:
+            raise ValueError("invalid_time")
 
-        break_minutes = int(break_text) if break_text else 0
-        paid_hours = float(paid_text) if paid_text else 0
-        unpaid_overtime_amount = float(amount_text) if amount_text else 0
-        unpaid_overtime_paid = 1 if self.unpaid_overtime_paid_checkbox.isChecked() else 0
+        try:
+            break_minutes = int(break_text) if break_text else 0
+        except Exception:
+            raise ValueError("invalid_number")
 
+        if break_minutes < 0:
+            raise ValueError("negative_number")
+
+        paid_hours = 0
+
+        unpaid_overtime_paid = 0
         overtime_payment_date = None
-        if unpaid_overtime_paid == 1:
-            overtime_payment_date = self.payment_date_input.date().toString("yyyy-MM-dd")
 
-        start = datetime.strptime(check_in, "%H:%M")
-        end = datetime.strptime(check_out, "%H:%M")
-
+        if end <= start:
+            from datetime import timedelta
+            end += timedelta(days=1)
         actual_hours = ((end - start).total_seconds() / 60 - break_minutes) / 60
 
         if actual_hours < 0:
-            raise ValueError
+            raise ValueError("negative_hours")
 
-        total_hours = max(actual_hours, 8)
-        overtime_hours = max(0, total_hours - 8)
+        total_hours = actual_hours
+        overtime_hours = 0
         unpaid_hours = max(0, total_hours - paid_hours)
+        unpaid_overtime_amount = 0
 
         return {
             "check_in": check_in,
@@ -535,8 +832,21 @@ class PayrollApp(QWidget):
 
         try:
             values = self.calculate_attendance_values()
-        except ValueError:
-            QMessageBox.warning(self, "Σφάλμα", "Έλεγξε ώρες και αριθμούς")
+        except ValueError as error:
+            error_text = str(error)
+
+            if error_text == "missing_time":
+                QMessageBox.warning(self, "Σφάλμα", "Συμπλήρωσε προσέλευση και αποχώρηση.")
+            elif error_text == "invalid_time":
+                QMessageBox.warning(self, "Σφάλμα", "Μη έγκυρη ώρα. Βάλε ώρα όπως 9, 09:00 ή 9:30.")
+            elif error_text == "invalid_number":
+                QMessageBox.warning(self, "Σφάλμα", "Μη έγκυρος αριθμός. Βάλε τιμή όπως 8, 8.5 ή 8,5.")
+            elif error_text == "negative_number":
+                QMessageBox.warning(self, "Σφάλμα", "Οι αριθμοί δεν μπορούν να είναι αρνητικοί.")
+            elif error_text == "negative_hours":
+                QMessageBox.warning(self, "Σφάλμα", "Η αποχώρηση πρέπει να είναι μετά την προσέλευση.")
+            else:
+                QMessageBox.warning(self, "Σφάλμα", "Έλεγξε ώρες και αριθμούς.")
             return
 
         if self.editing_record_id is None:
@@ -544,39 +854,288 @@ class PayrollApp(QWidget):
                 INSERT INTO attendance (
                     employee_id, date, check_in, check_out, break_minutes,
                     total_hours, paid_hours, unpaid_hours, overtime_hours,
-                    unpaid_overtime_amount, unpaid_overtime_paid,
+                    unpaid_overtime_rate, unpaid_overtime_amount, unpaid_overtime_paid,
                     overtime_payment_date
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 employee_id, date, values["check_in"], values["check_out"],
                 values["break_minutes"], values["total_hours"], values["paid_hours"],
-                values["unpaid_hours"], values["overtime_hours"],
+                values["unpaid_hours"], values["overtime_hours"], 0,
                 values["unpaid_overtime_amount"], values["unpaid_overtime_paid"],
                 values["overtime_payment_date"]
             ))
             message = "Αποθηκεύτηκε"
+            self.last_edit_snapshot = None
         else:
+            self.cursor.execute("""
+                SELECT employee_id, date, check_in, check_out, break_minutes,
+                       total_hours, paid_hours, unpaid_hours, overtime_hours,
+                       unpaid_overtime_rate, unpaid_overtime_amount, unpaid_overtime_paid,
+                       overtime_payment_date
+                FROM attendance
+                WHERE id = ?
+            """, (self.editing_record_id,))
+
+            previous_record = self.cursor.fetchone()
+
+            if previous_record is not None:
+                self.last_edit_snapshot = {
+                    "id": self.editing_record_id,
+                    "values": previous_record
+                }
+
             self.cursor.execute("""
                 UPDATE attendance
                 SET employee_id = ?, date = ?, check_in = ?, check_out = ?,
                     break_minutes = ?, total_hours = ?, paid_hours = ?,
                     unpaid_hours = ?, overtime_hours = ?,
-                    unpaid_overtime_amount = ?, unpaid_overtime_paid = ?,
+                    unpaid_overtime_rate = ?, unpaid_overtime_amount = ?, unpaid_overtime_paid = ?,
                     overtime_payment_date = ?
                 WHERE id = ?
             """, (
                 employee_id, date, values["check_in"], values["check_out"],
                 values["break_minutes"], values["total_hours"], values["paid_hours"],
-                values["unpaid_hours"], values["overtime_hours"],
+                values["unpaid_hours"], values["overtime_hours"], 0,
                 values["unpaid_overtime_amount"], values["unpaid_overtime_paid"],
                 values["overtime_payment_date"], self.editing_record_id
             ))
             message = "Ενημερώθηκε"
 
         self.conn.commit()
-        self.result_label.setText(f"{message}: {values['total_hours']:.2f} ώρες")
+
+        self.filter_employee_select.setCurrentIndex(0)
+        self.employee_search_input.clear()
+        monthly_index = self.monthly_employee_select.findData(employee_id)
+        if monthly_index >= 0:
+            self.monthly_employee_select.blockSignals(True)
+            self.monthly_employee_select.setCurrentIndex(monthly_index)
+            self.monthly_employee_select.blockSignals(False)
+
+        rate_row = self.cursor.execute(
+            "SELECT hourly_rate FROM employees WHERE id=?", (employee_id,)
+        ).fetchone()
+        hourly_rate = float(rate_row[0] or 0) if rate_row else 0.0
+        daily_amount = values["total_hours"] * hourly_rate
+        self.result_label.setText(
+            f"{message}: {values['total_hours']:.2f} πραγματικές ώρες × "
+            f"{hourly_rate:.2f} €/ώρα = {daily_amount:.2f} €"
+        )
+
         self.clear_attendance_form()
+        self.load_employees()
+        self.load_history()
+        self.load_monthly_summary()
+
+    def save_monthly_payroll(self):
+        employee_id = self.monthly_employee_select.currentData()
+        try:
+            year = int(self.monthly_year_input.text().strip())
+            month = int(self.monthly_month_select.currentData())
+            paid_hours = self.parse_number(self.monthly_paid_hours_input.text())
+            hourly_rate = self.parse_number(self.monthly_hourly_rate_input.text())
+            if year < 1900 or year > 9999 or paid_hours < 0 or hourly_rate < 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            QMessageBox.warning(self, "Σφάλμα", "Έλεγξε το έτος, τις πληρωμένες ώρες και το ωρομίσθιο. Χρησιμοποίησε τελεία ή κόμμα στα δεκαδικά.")
+            return
+        if employee_id is None:
+            QMessageBox.warning(self, "Σφάλμα", "Επίλεξε υπάλληλο.")
+            return
+        if not self.monthly_hourly_rate_input.text().strip():
+            rate_row = self.cursor.execute(
+                "SELECT hourly_rate FROM employees WHERE id=?", (employee_id,)
+            ).fetchone()
+            hourly_rate = float(rate_row[0] or 0) if rate_row else 0.0
+        else:
+            hourly_rate = self.parse_number(self.monthly_hourly_rate_input.text())
+        now = datetime.now().isoformat(timespec="seconds")
+        self.cursor.execute("""
+            INSERT INTO monthly_payments(employee_id, year, month, paid_hours, hourly_rate, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(employee_id, year, month) DO UPDATE SET
+                paid_hours=excluded.paid_hours,
+                hourly_rate=excluded.hourly_rate,
+                updated_at=excluded.updated_at
+        """, (employee_id, year, month, paid_hours, hourly_rate, now, now))
+        self.conn.commit()
+        self.load_monthly_summary()
+        self.load_history()
+
+    def refresh_monthly_views(self, *_args):
+        self.fill_default_monthly_rate()
+        self.load_monthly_summary()
+        self.load_history()
+
+    def sync_monthly_from_payroll_filters(self, *_args):
+        if not hasattr(self, "monthly_employee_select") or self.monthly_employee_select.count() == 0:
+            self.load_history()
+            return
+
+        employee_id = self.filter_employee_select.currentData()
+        if employee_id is not None:
+            employee_index = self.monthly_employee_select.findData(employee_id)
+            if employee_index >= 0:
+                self.monthly_employee_select.blockSignals(True)
+                self.monthly_employee_select.setCurrentIndex(employee_index)
+                self.monthly_employee_select.blockSignals(False)
+
+        period_date = self.to_date_input.date()
+        month_index = self.monthly_month_select.findData(period_date.month())
+        self.monthly_month_select.blockSignals(True)
+        if month_index >= 0:
+            self.monthly_month_select.setCurrentIndex(month_index)
+        self.monthly_month_select.blockSignals(False)
+        self.monthly_year_input.blockSignals(True)
+        self.monthly_year_input.setText(str(period_date.year()))
+        self.monthly_year_input.blockSignals(False)
+        self.load_monthly_summary()
+        self.load_history()
+
+    def fill_default_monthly_rate(self):
+        if not hasattr(self, "monthly_employee_select") or self.monthly_employee_select.currentData() is None:
+            return
+        try:
+            year = int(self.monthly_year_input.text().strip())
+            month = int(self.monthly_month_select.currentData())
+        except (ValueError, TypeError):
+            return
+        employee_id = self.monthly_employee_select.currentData()
+        saved = self.cursor.execute(
+            "SELECT hourly_rate FROM monthly_payments WHERE employee_id=? AND year=? AND month=?",
+            (employee_id, year, month),
+        ).fetchone()
+        if saved:
+            rate = saved[0]
+        else:
+            row = self.cursor.execute("SELECT hourly_rate FROM employees WHERE id=?", (employee_id,)).fetchone()
+            rate = row[0] if row else 0
+        self.monthly_hourly_rate_input.setText(str(float(rate or 0)))
+
+    def calculate_monthly_payroll(self, employee_id, year, month):
+        start = f"{year:04d}-{month:02d}-01"
+        end = f"{year:04d}-{month + 1:02d}-01" if month < 12 else f"{year + 1:04d}-01-01"
+        rows = self.cursor.execute(
+            "SELECT date, total_hours, check_in, check_out, break_minutes FROM attendance WHERE employee_id=?",
+            (employee_id,),
+        ).fetchall()
+        actual_hours = 0.0
+        for date_value, stored_hours, check_in, check_out, break_minutes in rows:
+            try:
+                normalized_date = datetime.strptime(
+                    str(date_value), "%Y-%m-%d" if "-" in str(date_value) else "%Y/%m/%d"
+                ).strftime("%Y-%m-%d")
+                if not (start <= normalized_date < end):
+                    continue
+                start_time = datetime.strptime(self.normalize_time(check_in or ""), "%H:%M")
+                end_time = datetime.strptime(self.normalize_time(check_out or ""), "%H:%M")
+                if end_time <= start_time:
+                    from datetime import timedelta
+                    end_time += timedelta(days=1)
+                actual_hours += max(
+                    0.0,
+                    (end_time - start_time).total_seconds() / 3600 - int(break_minutes or 0) / 60,
+                )
+            except (TypeError, ValueError):
+                try:
+                    normalized_date = datetime.strptime(
+                        str(date_value), "%Y-%m-%d" if "-" in str(date_value) else "%Y/%m/%d"
+                    ).strftime("%Y-%m-%d")
+                    if start <= normalized_date < end:
+                        actual_hours += max(0.0, float(stored_hours or 0))
+                except (TypeError, ValueError):
+                    continue
+
+        payment = self.cursor.execute(
+            "SELECT paid_hours, hourly_rate FROM monthly_payments WHERE employee_id=? AND year=? AND month=?",
+            (employee_id, year, month),
+        ).fetchone()
+        if payment:
+            paid_hours, hourly_rate = float(payment[0] or 0), float(payment[1] or 0)
+        else:
+            paid_hours = 0.0
+            rate_row = self.cursor.execute(
+                "SELECT hourly_rate FROM employees WHERE id=?", (employee_id,)
+            ).fetchone()
+            hourly_rate = float(rate_row[0] or 0) if rate_row else 0.0
+        cash_payments = float(self.cursor.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM payroll_payments WHERE employee_id=? AND year=? AND month=?",
+            (employee_id, year, month),
+        ).fetchone()[0] or 0)
+        gross_pay = actual_hours * hourly_rate
+        total_paid_amount = paid_hours * hourly_rate + cash_payments
+        amount_due = max(0.0, gross_pay - total_paid_amount)
+        extra_paid_amount = max(0.0, total_paid_amount - gross_pay)
+        if hourly_rate > 0:
+            paid_equivalent_hours = total_paid_amount / hourly_rate
+            outstanding_hours = amount_due / hourly_rate
+            extra_paid_hours = extra_paid_amount / hourly_rate
+        else:
+            paid_equivalent_hours = paid_hours
+            outstanding_hours = max(0.0, actual_hours - paid_hours)
+            extra_paid_hours = max(0.0, paid_hours - actual_hours)
+        return {
+            "actual_hours": actual_hours,
+            "paid_hours": paid_hours,
+            "paid_equivalent_hours": paid_equivalent_hours,
+            "cash_payments": cash_payments,
+            "total_paid_amount": total_paid_amount,
+            "gross_pay": gross_pay,
+            "outstanding_hours": outstanding_hours,
+            "extra_paid_hours": extra_paid_hours,
+            "extra_paid_amount": extra_paid_amount,
+            "hourly_rate": hourly_rate,
+            "amount_due": amount_due,
+        }
+
+    def load_monthly_summary(self):
+        if not hasattr(self, "monthly_summary_label"):
+            return
+        employee_id = self.monthly_employee_select.currentData()
+        try:
+            year = int(self.monthly_year_input.text().strip())
+            month = int(self.monthly_month_select.currentData())
+        except (ValueError, TypeError):
+            self.monthly_summary_label.setText("Έλεγξε μήνα και έτος.")
+            return
+        if employee_id is None:
+            self.monthly_summary_label.setText("Πρόσθεσε ή επίλεξε υπάλληλο για μηνιαία σύνοψη.")
+            return
+        payroll = self.calculate_monthly_payroll(employee_id, year, month)
+        self.monthly_paid_hours_input.setText(str(payroll["paid_hours"]))
+        self.monthly_hourly_rate_input.setText(str(payroll["hourly_rate"]))
+        self.monthly_summary_label.setText(
+            f"Σύνολο μισθοδοσίας: {payroll['gross_pay']:.2f} € | "
+            f"Πληρωμένο ποσό: {payroll['total_paid_amount']:.2f} € "
+            f"(δόσεις: {payroll['cash_payments']:.2f} €) | "
+            f"Πραγματικές ώρες: {payroll['actual_hours']:.2f} | "
+            f"Πληρωμένες ώρες: {payroll['paid_equivalent_hours']:.2f} | "
+            f"Υπόλοιπο: {payroll['outstanding_hours']:.2f} ώρες | Ωρομίσθιο: {payroll['hourly_rate']:.2f} € | "
+            f"Οφειλόμενο: {payroll['amount_due']:.2f} €" +
+            (f" | Επιπλέον πληρωμένα: {payroll['extra_paid_amount']:.2f} €" if payroll['extra_paid_amount'] else "")
+        )
+
+    def add_monthly_payment(self):
+        employee_id = self.monthly_employee_select.currentData()
+        try:
+            year = int(self.monthly_year_input.text().strip())
+            month = int(self.monthly_month_select.currentData())
+            amount = self.parse_number(self.new_payment_amount_input.text())
+            if year < 1900 or year > 9999 or amount <= 0:
+                raise ValueError
+        except (ValueError, TypeError):
+            QMessageBox.warning(self, "Σφάλμα", "Βάλε έγκυρο μήνα, έτος και ποσό πληρωμής μεγαλύτερο από 0.")
+            return
+        if employee_id is None:
+            QMessageBox.warning(self, "Σφάλμα", "Επίλεξε υπάλληλο για την πληρωμή.")
+            return
+        self.cursor.execute(
+            "INSERT INTO payroll_payments(employee_id, year, month, amount, created_at) VALUES (?, ?, ?, ?, ?)",
+            (employee_id, year, month, amount, datetime.now().isoformat(timespec="seconds")),
+        )
+        self.conn.commit()
+        self.new_payment_amount_input.clear()
+        self.load_monthly_summary()
         self.load_history()
 
     def clear_attendance_form(self):
@@ -585,10 +1144,6 @@ class PayrollApp(QWidget):
         self.check_in_input.clear()
         self.check_out_input.clear()
         self.break_input.clear()
-        self.paid_hours_input.clear()
-        self.unpaid_overtime_amount_input.clear()
-        self.unpaid_overtime_paid_checkbox.setChecked(False)
-        self.payment_date_input.setDate(QDate.currentDate())
 
     def cancel_edit(self):
         self.clear_attendance_form()
@@ -596,7 +1151,6 @@ class PayrollApp(QWidget):
 
     def clear_filters(self):
         self.employee_search_input.clear()
-        self.overtime_payment_filter.setCurrentIndex(0)
         self.filter_employee_select.setCurrentIndex(0)
         self.from_date_input.setDate(QDate.currentDate().addMonths(-1))
         self.to_date_input.setDate(QDate.currentDate())
@@ -622,22 +1176,18 @@ class PayrollApp(QWidget):
             return
 
         self.cursor.execute("""
-            SELECT id, employee_id, date, check_in, check_out, break_minutes,
-                   paid_hours, unpaid_overtime_amount, unpaid_overtime_paid,
-                   overtime_payment_date
-            FROM attendance
-            WHERE id = ?
+            SELECT id, employee_id, date, check_in, check_out, break_minutes
+            FROM attendance WHERE id = ?
         """, (record_id,))
 
         record = self.cursor.fetchone()
 
         if record is None:
+            QMessageBox.warning(self, "Σφάλμα", "Δεν βρέθηκε η καταχώρηση")
             return
 
         (
-            attendance_id, employee_id, date, check_in, check_out,
-            break_minutes, paid_hours, unpaid_overtime_amount,
-            unpaid_overtime_paid, overtime_payment_date
+            attendance_id, employee_id, date, check_in, check_out, break_minutes
         ) = record
 
         self.editing_record_id = attendance_id
@@ -653,16 +1203,46 @@ class PayrollApp(QWidget):
         self.check_in_input.setText(check_in)
         self.check_out_input.setText(check_out)
         self.break_input.setText(str(break_minutes or 0))
-        self.paid_hours_input.setText(str(paid_hours or 0))
-        self.unpaid_overtime_amount_input.setText(str(unpaid_overtime_amount or 0))
-        self.unpaid_overtime_paid_checkbox.setChecked(int(unpaid_overtime_paid or 0) == 1)
-
-        parsed_payment_date = QDate.fromString(str(overtime_payment_date), "yyyy-MM-dd")
-        if parsed_payment_date.isValid():
-            self.payment_date_input.setDate(parsed_payment_date)
 
         self.save_btn.setText("Ενημέρωση Καταχώρησης")
         self.result_label.setText(f"Επεξεργασία ID {attendance_id}")
+
+        if hasattr(self, "tabs"):
+            self.tabs.setCurrentIndex(1)
+
+    def undo_last_edit(self):
+        if not self.last_edit_snapshot:
+            QMessageBox.information(self, "Αναίρεση", "Δεν υπάρχει πρόσφατη αλλαγή μισθοδοσίας για αναίρεση.")
+            return
+
+        record_id = self.last_edit_snapshot["id"]
+        previous_values = self.last_edit_snapshot["values"]
+
+        self.cursor.execute("""
+            UPDATE attendance
+            SET employee_id = ?,
+                date = ?,
+                check_in = ?,
+                check_out = ?,
+                break_minutes = ?,
+                total_hours = ?,
+                paid_hours = ?,
+                unpaid_hours = ?,
+                overtime_hours = ?,
+                unpaid_overtime_rate = ?,
+                unpaid_overtime_amount = ?,
+                unpaid_overtime_paid = ?,
+                overtime_payment_date = ?
+            WHERE id = ?
+        """, (*previous_values, record_id))
+
+        self.conn.commit()
+        self.last_edit_snapshot = None
+        self.clear_attendance_form()
+        self.load_employees()
+        self.load_history()
+
+        QMessageBox.information(self, "Αναίρεση", f"Η αλλαγή της καταχώρησης ID {record_id} αναιρέθηκε.")
 
     def delete_selected_record(self):
         record_id = self.get_selected_record_id()
@@ -677,42 +1257,9 @@ class PayrollApp(QWidget):
         self.conn.commit()
         self.load_history()
 
-    def mark_selected_as_paid(self):
-        record_id = self.get_selected_record_id()
-        if record_id is None:
-            return
-
-        payment_date = QDate.currentDate().toString("yyyy-MM-dd")
-
-        self.cursor.execute("""
-            UPDATE attendance
-            SET unpaid_overtime_paid = 1,
-                overtime_payment_date = ?
-            WHERE id = ?
-        """, (payment_date, record_id))
-
-        self.conn.commit()
-        self.load_history()
-
-    def mark_selected_as_unpaid(self):
-        record_id = self.get_selected_record_id()
-        if record_id is None:
-            return
-
-        self.cursor.execute("""
-            UPDATE attendance
-            SET unpaid_overtime_paid = 0,
-                overtime_payment_date = NULL
-            WHERE id = ?
-        """, (record_id,))
-
-        self.conn.commit()
-        self.load_history()
-
     def get_filtered_records(self):
         employee_id = self.filter_employee_select.currentData()
         search = self.employee_search_input.text().strip()
-        payment_filter = self.overtime_payment_filter.currentData()
 
         from_date = self.from_date_input.date().toString("yyyy-MM-dd")
         to_date = self.to_date_input.date().toString("yyyy-MM-dd")
@@ -720,11 +1267,7 @@ class PayrollApp(QWidget):
         query = """
             SELECT attendance.id, employees.name, attendance.date,
                    attendance.check_in, attendance.check_out,
-                   attendance.total_hours, attendance.paid_hours,
-                   attendance.unpaid_hours, attendance.overtime_hours,
-                   attendance.unpaid_overtime_amount,
-                   attendance.unpaid_overtime_paid,
-                   attendance.overtime_payment_date
+                   attendance.break_minutes, attendance.total_hours
             FROM attendance
             JOIN employees ON attendance.employee_id = employees.id
             WHERE attendance.date >= ?
@@ -741,12 +1284,6 @@ class PayrollApp(QWidget):
             query += " AND employees.name LIKE ?"
             params.append(f"%{search}%")
 
-        if payment_filter == "paid":
-            query += " AND attendance.overtime_hours > 0 AND attendance.unpaid_overtime_paid = 1"
-
-        if payment_filter == "unpaid":
-            query += " AND attendance.overtime_hours > 0 AND attendance.unpaid_overtime_paid = 0"
-
         query += " ORDER BY attendance.date DESC, attendance.id DESC"
 
         self.cursor.execute(query, params)
@@ -759,86 +1296,42 @@ class PayrollApp(QWidget):
         self.history_table.setRowCount(len(records))
 
         totals = {}
-        total_hours_sum = 0
-        paid_hours_sum = 0
-        unpaid_hours_sum = 0
-        overtime_hours_sum = 0
-        overtime_amount_sum = 0
-        unpaid_balance_sum = 0
+        total_hours_sum = 0.0
+        month = int(self.monthly_month_select.currentData())
+        year = int(self.monthly_year_input.text())
 
         for row, record in enumerate(records):
             employee = record[1]
-            total_hours = float(record[5] or 0)
-            paid_hours = float(record[6] or 0)
-            unpaid_hours = float(record[7] or 0)
-            overtime_hours = float(record[8] or 0)
-            amount = float(record[9] or 0)
-            paid_status = int(record[10] or 0)
-
+            total_hours = float(record[6] or 0)
             total_hours_sum += total_hours
-            paid_hours_sum += paid_hours
-            unpaid_hours_sum += unpaid_hours
-            overtime_hours_sum += overtime_hours
-            overtime_amount_sum += amount
-
-            if paid_status == 0:
-                unpaid_balance_sum += amount
 
             if employee not in totals:
-                totals[employee] = [0, 0, 0, 0, 0]
-
-            totals[employee][0] += total_hours
-            totals[employee][1] += paid_hours
-            totals[employee][2] += unpaid_hours
-            totals[employee][3] += overtime_hours
-
-            if paid_status == 0:
-                totals[employee][4] += amount
-
-            display = list(record)
-            display[10] = "Ναι" if paid_status == 1 else "Όχι"
-            display[11] = display[11] if display[11] else "-"
-
-            for col, value in enumerate(display):
+                totals[employee] = {"id": self.cursor.execute("SELECT id FROM employees WHERE name=?", (employee,)).fetchone()[0], "hours": 0.0}
+            totals[employee]["hours"] += total_hours
+            for col, value in enumerate(record):
                 item = QTableWidgetItem(str(value))
-
-                if col == 10:
-                    item.setBackground(QColor("#1f7a1f") if paid_status == 1 else QColor("#8a1f1f"))
-
-                if col == 9 and paid_status == 0 and amount > 0:
-                    item.setBackground(QColor("#8a1f1f"))
-
                 self.history_table.setItem(row, col, item)
 
         self.history_table.resizeColumnsToContents()
 
         self.summary_label.setText(
-            f"Σύνολα Περιόδου\n\n"
-            f"Σύνολο Ωρών: {total_hours_sum:.2f}\n"
-            f"Πληρωμένες: {paid_hours_sum:.2f}\n"
-            f"Απλήρωτες: {unpaid_hours_sum:.2f}\n"
-            f"Υπερωρίες: {overtime_hours_sum:.2f}\n\n"
-            f"Ποσά Υπερωριών: {overtime_amount_sum:.2f} €\n"
-            f"Οφειλόμενα: {unpaid_balance_sum:.2f} €"
+            f"Σύνολα περιόδου\nΠραγματικές ώρες εργασίας: {total_hours_sum:.2f}"
         )
 
         self.employee_summary_table.clearContents()
         self.employee_summary_table.setRowCount(len(totals))
 
         for row, (employee, values) in enumerate(totals.items()):
-            row_values = [
-                employee,
-                f"{values[0]:.2f}",
-                f"{values[1]:.2f}",
-                f"{values[2]:.2f}",
-                f"{values[3]:.2f}",
-                f"{values[4]:.2f} €"
-            ]
+            employee_id = values["id"]
+            payroll = self.calculate_monthly_payroll(employee_id, year, month)
+            month_hours = payroll["actual_hours"]
+            row_values = [employee, f"{month_hours:.2f}", f"{payroll['paid_equivalent_hours']:.2f}",
+                          f"{payroll['outstanding_hours']:.2f}" + (f" (επιπλέον {payroll['extra_paid_hours']:.2f})" if payroll['extra_paid_hours'] else ""),
+                          f"{payroll['gross_pay']:.2f} €", f"{payroll['total_paid_amount']:.2f} €",
+                          f"{payroll['amount_due']:.2f} €"]
 
             for col, value in enumerate(row_values):
                 item = QTableWidgetItem(value)
-                if col == 5 and values[4] > 0:
-                    item.setBackground(QColor("#8a1f1f"))
                 self.employee_summary_table.setItem(row, col, item)
 
         self.employee_summary_table.resizeColumnsToContents()
@@ -863,20 +1356,110 @@ class PayrollApp(QWidget):
 
         headers = [
             "ID", "Υπάλληλος", "Ημερομηνία", "Προσέλευση", "Αποχώρηση",
-            "Σύνολο", "Πληρωμένες", "Απλήρωτες", "Υπερωρίες",
-            "Ποσό Υπερωριών", "Πληρώθηκε;", "Ημ/νία Πληρωμής"
+            "Διάλειμμα (λεπτά)", "Πραγματικές Ώρες"
         ]
 
         sheet.append(headers)
 
         for record in records:
             row = list(record)
-            row[10] = "Ναι" if int(record[10] or 0) == 1 else "Όχι"
-            row[11] = row[11] if row[11] else "-"
             sheet.append(row)
 
         workbook.save(file_path)
         QMessageBox.information(self, "Ολοκληρώθηκε", "Το Excel αποθηκεύτηκε")
+
+    def export_employee_payroll_to_excel(self):
+        employee_id = self.filter_employee_select.currentData()
+        if employee_id is None:
+            QMessageBox.warning(self, "Επίλεξε υπάλληλο", "Στα φίλτρα Payroll επίλεξε έναν συγκεκριμένο υπάλληλο πριν από την εξαγωγή.")
+            return
+
+        employee = self.cursor.execute(
+            "SELECT name, hourly_rate FROM employees WHERE id=?", (employee_id,)
+        ).fetchone()
+        if employee is None:
+            QMessageBox.warning(self, "Σφάλμα", "Δεν βρέθηκε ο επιλεγμένος υπάλληλος.")
+            return
+        employee_name, base_rate = employee
+        from_date = self.from_date_input.date().toString("yyyy-MM-dd")
+        to_date = self.to_date_input.date().toString("yyyy-MM-dd")
+        start_year, start_month = map(int, from_date[:7].split("-"))
+        end_year, end_month = map(int, to_date[:7].split("-"))
+        start_period = start_year * 100 + start_month
+        end_period = end_year * 100 + end_month
+
+        attendance = self.cursor.execute("""
+            SELECT date, check_in, check_out, break_minutes, total_hours
+            FROM attendance
+            WHERE employee_id=? AND date>=? AND date<=?
+            ORDER BY date, id
+        """, (employee_id, from_date, to_date)).fetchall()
+        month_payrolls = self.cursor.execute("""
+            SELECT year, month, paid_hours, hourly_rate, updated_at
+            FROM monthly_payments
+            WHERE employee_id=? AND year*100+month BETWEEN ? AND ?
+            ORDER BY year, month
+        """, (employee_id, start_period, end_period)).fetchall()
+        cash_payments = self.cursor.execute("""
+            SELECT year, month, amount, created_at
+            FROM payroll_payments
+            WHERE employee_id=? AND year*100+month BETWEEN ? AND ?
+            ORDER BY year, month, created_at, id
+        """, (employee_id, start_period, end_period)).fetchall()
+
+        safe_name = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in employee_name).strip("_")
+        suggested = f"{safe_name}_payroll_{from_date}_to_{to_date}.xlsx"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Εξαγωγή Παρουσιών & Πληρωμών", suggested, "Excel Files (*.xlsx)"
+        )
+        if not file_path:
+            return
+
+        workbook = Workbook()
+        summary = workbook.active
+        summary.title = "Σύνοψη"
+        summary.append(["Υπάλληλος", employee_name])
+        summary.append(["Περίοδος παρουσιών", from_date, to_date])
+        summary.append(["Πραγματικές ώρες", sum(float(row[4] or 0) for row in attendance)])
+        summary.append(["Πληρωμένες ώρες payroll", sum(float(row[2] or 0) for row in month_payrolls)])
+        monthly_paid_amount = sum(float(row[2] or 0) * float(row[3] or 0) for row in month_payrolls)
+        cash_paid_amount = sum(float(row[2] or 0) for row in cash_payments)
+        summary.append(["Ποσό πληρωμένων ωρών", monthly_paid_amount])
+        summary.append(["Καταχωρημένες πληρωμές ποσού", cash_paid_amount])
+        summary.append(["Συνολικά καταχωρημένο πληρωμένο ποσό", monthly_paid_amount + cash_paid_amount])
+        summary.append(["Βασικό ωρομίσθιο", float(base_rate or 0)])
+
+        attendance_sheet = workbook.create_sheet("Παρουσίες")
+        attendance_sheet.append(["Ημερομηνία", "Προσέλευση", "Αποχώρηση", "Διάλειμμα (λεπτά)", "Πραγματικές ώρες", "Ωρομίσθιο (€)", "Αξία ωρών (€)"])
+        gross_amount = 0.0
+        for date_value, check_in, check_out, break_minutes, hours in attendance:
+            year, month = map(int, date_value[:7].split("-"))
+            rate_row = self.cursor.execute(
+                "SELECT hourly_rate FROM monthly_payments WHERE employee_id=? AND year=? AND month=?",
+                (employee_id, year, month),
+            ).fetchone()
+            rate = float(rate_row[0] or 0) if rate_row else float(base_rate or 0)
+            hours = float(hours or 0)
+            gross_amount += hours * rate
+            attendance_sheet.append([date_value, check_in, check_out, break_minutes, hours, rate, hours * rate])
+        summary.append(["Αξία παρουσιών στην περίοδο", gross_amount])
+
+        payments_sheet = workbook.create_sheet("Πληρωμές")
+        payments_sheet.append(["Έτος", "Μήνας", "Τύπος", "Ποσό (€)", "Ώρες", "Ωρομίσθιο (€)", "Ημερομηνία καταχώρισης"])
+        for year, month, paid_hours, rate, updated_at in month_payrolls:
+            payments_sheet.append([year, month, "Ώρες ήδη πληρωμένες", float(paid_hours or 0) * float(rate or 0), float(paid_hours or 0), float(rate or 0), updated_at])
+        for year, month, amount, created_at in cash_payments:
+            payments_sheet.append([year, month, "Μερική πληρωμή", float(amount), "", "", created_at])
+
+        for sheet in workbook.worksheets:
+            sheet.freeze_panes = "A2"
+            sheet.auto_filter.ref = sheet.dimensions if sheet.max_row > 1 else None
+            for column_cells in sheet.columns:
+                width = min(max(max(len(str(cell.value or "")) for cell in column_cells) + 2, 12), 42)
+                sheet.column_dimensions[column_cells[0].column_letter].width = width
+
+        workbook.save(file_path)
+        QMessageBox.information(self, "Ολοκληρώθηκε", f"Η εξαγωγή για τον/την {employee_name} αποθηκεύτηκε.")
 
     def export_to_pdf(self):
         records = self.get_filtered_records()
@@ -905,9 +1488,8 @@ class PayrollApp(QWidget):
         for record in records:
             line = (
                 f"ID:{record[0]} | {record[1]} | {record[2]} | "
-                f"{record[3]}-{record[4]} | Hours:{record[5]} | "
-                f"OT:{record[8]} | Amount:{record[9]} | "
-                f"Paid:{'Yes' if int(record[10] or 0) == 1 else 'No'}"
+                f"{record[3]}-{record[4]} | Break:{record[5]} min | "
+                f"Actual hours:{record[6]}"
             )
 
             pdf.drawString(40, y, line)
@@ -952,23 +1534,18 @@ class PayrollApp(QWidget):
 
         for record in records:
             employee = record[1]
-            amount = float(record[9] or 0)
-            paid_status = int(record[10] or 0)
-
             if employee not in totals:
                 totals[employee] = 0
-
-            if paid_status == 0:
-                totals[employee] += amount
+            totals[employee] += float(record[6] or 0)
 
         names = list(totals.keys())
         amounts = list(totals.values())
 
         plt.figure(figsize=(10, 6))
         plt.bar(names, amounts)
-        plt.title("Οφειλόμενα ποσά υπερωριών ανά υπάλληλο")
+        plt.title("Πραγματικές ώρες ανά υπάλληλο")
         plt.xlabel("Υπάλληλος")
-        plt.ylabel("Ποσό (€)")
+        plt.ylabel("Ώρες")
         plt.xticks(rotation=45)
         plt.tight_layout()
         plt.show()

@@ -1,0 +1,46 @@
+name: Windows test build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - windows-test
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-windows.txt
+
+      - name: Install Python dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements-windows.txt
+
+      - name: Build Windows application
+        run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name PrometheusPayroll --icon PrometheusPayroll.ico --collect-all PySide6 --collect-all matplotlib app.py
+
+      - name: Create installer
+        shell: pwsh
+        run: |
+          choco install innosetup --yes --no-progress
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" PrometheusPayroll.iss
+
+      - name: Upload test build
+        uses: actions/upload-artifact@v4
+        with:
+          name: PrometheusPayroll-Windows-test
+          path: |
+            dist/PrometheusPayroll.exe
+            dist/PrometheusPayroll-Setup-1.1.0.exe
+          if-no-files-found: error
+          retention-days: 14

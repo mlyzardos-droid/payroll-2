@@ -18,7 +18,8 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QListWidget, QLineEdit, QMessageBox, QComboBox, QTableWidget,
     QTableWidgetItem, QFileDialog, QDateEdit, QCheckBox, QTabWidget,
-    QScrollArea, QHeaderView, QSizePolicy, QGridLayout, QSplitter
+    QScrollArea, QHeaderView, QSizePolicy, QGridLayout, QSplitter,
+    QGroupBox, QToolButton
 )
 
 
@@ -139,6 +140,12 @@ class PayrollApp(QWidget):
                     background-color: #e0e0e0; color: #111; padding: 6px; border: 1px solid #ccc;
                 }
                 QListWidget { background-color: #ffffff; border: 1px solid #bbb; }
+                QGroupBox {
+                    border: 1px solid #ccc; border-radius: 8px;
+                    margin-top: 10px; padding: 10px;
+                }
+                QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
+                QLabel#payrollMetricValue { font-size: 19px; font-weight: bold; }
             """)
         else:
             self.setStyleSheet("""
@@ -159,6 +166,12 @@ class PayrollApp(QWidget):
                 QListWidget { background-color: #1f1f1f; border: 1px solid #444; }
                 QTabBar::tab { background: #222; color: white; padding: 10px; border-radius: 6px; }
                 QTabBar::tab:selected { background: #2d6cdf; }
+                QGroupBox {
+                    border: 1px solid #444; border-radius: 8px;
+                    margin-top: 10px; padding: 10px;
+                }
+                QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; }
+                QLabel#payrollMetricValue { font-size: 19px; font-weight: bold; }
             """)
 
     def build_tabs_view(self):
@@ -319,37 +332,48 @@ class PayrollApp(QWidget):
 
     def build_payroll_ui(self, parent):
         layout = QVBoxLayout()
+        layout.setSpacing(12)
 
-        layout.addWidget(QLabel("Φίλτρα Payroll"))
-
-        self.employee_search_input = QLineEdit()
-        self.employee_search_input.setPlaceholderText("Αναζήτηση υπαλλήλου")
-        self.employee_search_input.textChanged.connect(self.load_history)
-        layout.addWidget(self.employee_search_input)
-
+        filters_box = QGroupBox("Περίοδος και υπάλληλος")
+        filters_layout = QGridLayout(filters_box)
+        filters_layout.setHorizontalSpacing(10)
+        filters_layout.setVerticalSpacing(6)
+        filters_layout.addWidget(QLabel("Υπάλληλος"), 0, 0, 1, 2)
+        filters_layout.addWidget(QLabel("Από"), 0, 2)
+        filters_layout.addWidget(QLabel("Έως"), 0, 3)
         self.filter_employee_select = QComboBox()
+        self.filter_employee_select.setEditable(True)
+        self.filter_employee_select.setInsertPolicy(QComboBox.NoInsert)
+        self.filter_employee_select.setMinimumWidth(180)
+        self.filter_employee_select.lineEdit().setPlaceholderText("Όλοι οι υπάλληλοι ή γράψε όνομα")
+        self.filter_employee_select.completer().setFilterMode(Qt.MatchContains)
+        self.filter_employee_select.completer().setCaseSensitivity(Qt.CaseInsensitive)
         self.filter_employee_select.currentIndexChanged.connect(self.sync_monthly_from_payroll_filters)
-        layout.addWidget(self.filter_employee_select)
-
-        layout.addWidget(QLabel("Από ημερομηνία"))
+        self.filter_employee_select.currentTextChanged.connect(self.load_history)
+        filters_layout.addWidget(self.filter_employee_select, 1, 0, 1, 2)
         self.from_date_input = QDateEdit()
         self.from_date_input.setCalendarPopup(True)
         self.from_date_input.setDate(QDate.currentDate().addMonths(-1))
         self.from_date_input.dateChanged.connect(self.sync_monthly_from_payroll_filters)
-        layout.addWidget(self.from_date_input)
-
-        layout.addWidget(QLabel("Έως ημερομηνία"))
+        filters_layout.addWidget(self.from_date_input, 1, 2)
         self.to_date_input = QDateEdit()
         self.to_date_input.setCalendarPopup(True)
         self.to_date_input.setDate(QDate.currentDate())
         self.to_date_input.dateChanged.connect(self.sync_monthly_from_payroll_filters)
-        layout.addWidget(self.to_date_input)
+        filters_layout.addWidget(self.to_date_input, 1, 3)
+        filters_layout.setColumnStretch(0, 2)
+        filters_layout.setColumnStretch(1, 1)
+        filters_layout.setColumnStretch(2, 1)
+        filters_layout.setColumnStretch(3, 1)
+        layout.addWidget(filters_box)
 
         clear_btn = QPushButton("Καθαρισμός Φίλτρων")
         clear_btn.clicked.connect(self.clear_filters)
-        layout.addWidget(clear_btn)
+        clear_btn.setMaximumWidth(180)
+        layout.addWidget(clear_btn, alignment=Qt.AlignRight)
 
         self.summary_label = QLabel("")
+        self.summary_label.setObjectName("payrollPeriodSummary")
         layout.addWidget(self.summary_label)
 
         self.employee_summary_table = QTableWidget()
@@ -360,12 +384,19 @@ class PayrollApp(QWidget):
         ])
         self.configure_responsive_table(self.employee_summary_table)
         self.employee_summary_table.setMinimumHeight(180)
+        self.employee_summary_table.cellClicked.connect(self.select_monthly_employee_from_row)
         layout.addWidget(self.employee_summary_table)
 
-        layout.addWidget(QLabel("Μηνιαία μισθοδοσία"))
+        monthly_box = QGroupBox("Μηνιαία μισθοδοσία")
+        monthly_layout = QVBoxLayout(monthly_box)
+        monthly_layout.setSpacing(10)
+        selectors = QGridLayout()
+        selectors.setHorizontalSpacing(10)
+        selectors.addWidget(QLabel("Υπάλληλος"), 0, 0)
+        selectors.addWidget(QLabel("Μήνας"), 0, 1)
+        selectors.addWidget(QLabel("Έτος"), 0, 2)
         self.monthly_employee_select = QComboBox()
-        layout.addWidget(self.monthly_employee_select)
-        monthly_period = QHBoxLayout()
+        selectors.addWidget(self.monthly_employee_select, 1, 0)
         self.monthly_month_select = QComboBox()
         for month in range(1, 13):
             self.monthly_month_select.addItem(
@@ -373,36 +404,93 @@ class PayrollApp(QWidget):
                  "Ιούλιος", "Αύγουστος", "Σεπτέμβριος", "Οκτώβριος", "Νοέμβριος", "Δεκέμβριος")[month - 1],
                 month,
             )
+        selectors.addWidget(self.monthly_month_select, 1, 1)
         self.monthly_year_input = QLineEdit(str(QDate.currentDate().year()))
         self.monthly_year_input.setPlaceholderText("Έτος")
-        monthly_period.addWidget(self.monthly_month_select)
-        monthly_period.addWidget(self.monthly_year_input)
-        layout.addLayout(monthly_period)
+        self.monthly_year_input.setMaximumWidth(130)
+        selectors.addWidget(self.monthly_year_input, 1, 2)
+        selectors.setColumnStretch(0, 3)
+        selectors.setColumnStretch(1, 2)
+        monthly_layout.addLayout(selectors)
+
+        metrics = QHBoxLayout()
+        metrics.setSpacing(10)
+        self.monthly_total_value = self.create_payroll_metric(metrics, "Σύνολο")
+        self.monthly_paid_value = self.create_payroll_metric(metrics, "Πληρωμένο")
+        self.monthly_due_value = self.create_payroll_metric(metrics, "Υπόλοιπο")
+        monthly_layout.addLayout(metrics)
+
+        payment_row = QHBoxLayout()
         self.monthly_paid_hours_input = QLineEdit()
         self.monthly_paid_hours_input.setPlaceholderText("Ώρες που έχουν ήδη πληρωθεί")
-        layout.addWidget(self.monthly_paid_hours_input)
         self.monthly_hourly_rate_input = QLineEdit()
         self.monthly_hourly_rate_input.setPlaceholderText("Ωρομίσθιο (€)")
-        layout.addWidget(self.monthly_hourly_rate_input)
         self.new_payment_amount_input = QLineEdit()
         self.new_payment_amount_input.setPlaceholderText("Πληρωμή τώρα (€), π.χ. 50 ή 50,00")
-        layout.addWidget(self.new_payment_amount_input)
+        self.new_payment_amount_input.setMinimumWidth(160)
+        payment_row.addWidget(self.new_payment_amount_input, 1)
         add_payment_btn = QPushButton("Καταχώριση Πληρωμής")
         add_payment_btn.clicked.connect(self.add_monthly_payment)
-        layout.addWidget(add_payment_btn)
+        add_payment_btn.setMinimumWidth(190)
+        payment_row.addWidget(add_payment_btn)
+        monthly_layout.addLayout(payment_row)
+
+        self.monthly_adjustments_toggle = QToolButton()
+        self.monthly_adjustments_toggle.setText("Προσαρμογή ωρών ή ωρομισθίου")
+        self.monthly_adjustments_toggle.setCheckable(True)
+        self.monthly_adjustments_toggle.setChecked(False)
+        self.monthly_adjustments_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.monthly_adjustments_toggle.setArrowType(Qt.RightArrow)
+        self.monthly_adjustments_panel = QWidget()
+        adjustments_layout = QGridLayout(self.monthly_adjustments_panel)
+        adjustments_layout.setContentsMargins(0, 0, 0, 0)
+        adjustments_layout.addWidget(QLabel("Ώρες που έχουν πληρωθεί"), 0, 0)
+        adjustments_layout.addWidget(QLabel("Ωρομίσθιο (€)"), 0, 1)
+        adjustments_layout.addWidget(self.monthly_paid_hours_input, 1, 0)
+        adjustments_layout.addWidget(self.monthly_hourly_rate_input, 1, 1)
         monthly_save = QPushButton("Αποθήκευση Μηνιαίας Μισθοδοσίας")
         monthly_save.clicked.connect(self.save_monthly_payroll)
-        layout.addWidget(monthly_save)
-        monthly_refresh = QPushButton("Προβολή Επιλεγμένου Μήνα")
-        monthly_refresh.clicked.connect(self.load_monthly_summary)
-        layout.addWidget(monthly_refresh)
+        adjustments_layout.addWidget(monthly_save, 2, 0, 1, 2)
+        self.monthly_adjustments_panel.setVisible(False)
+        self.monthly_adjustments_toggle.toggled.connect(self.toggle_monthly_adjustments)
+        monthly_layout.addWidget(self.monthly_adjustments_toggle)
+        monthly_layout.addWidget(self.monthly_adjustments_panel)
+
         self.monthly_month_select.currentIndexChanged.connect(self.refresh_monthly_views)
         self.monthly_year_input.textChanged.connect(self.refresh_monthly_views)
         self.monthly_employee_select.currentIndexChanged.connect(self.refresh_monthly_views)
         self.monthly_summary_label = QLabel("")
-        layout.addWidget(self.monthly_summary_label)
+        self.monthly_summary_label.setWordWrap(True)
+        monthly_layout.addWidget(self.monthly_summary_label)
+        layout.addWidget(monthly_box)
 
         parent.setLayout(layout)
+
+    @staticmethod
+    def create_payroll_metric(layout, title):
+        card = QGroupBox()
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(10, 8, 10, 8)
+        card_layout.setSpacing(2)
+        card_layout.addWidget(QLabel(title))
+        value = QLabel("—")
+        value.setObjectName("payrollMetricValue")
+        card_layout.addWidget(value)
+        layout.addWidget(card, 1)
+        return value
+
+    def toggle_monthly_adjustments(self, expanded):
+        self.monthly_adjustments_panel.setVisible(expanded)
+        self.monthly_adjustments_toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+
+    def select_monthly_employee_from_row(self, row, _column):
+        item = self.employee_summary_table.item(row, 0)
+        if item is None:
+            return
+        employee_id = item.data(Qt.UserRole)
+        index = self.monthly_employee_select.findData(employee_id)
+        if index >= 0:
+            self.monthly_employee_select.setCurrentIndex(index)
 
     def build_reports_ui(self, parent):
         layout = QVBoxLayout()
@@ -957,7 +1045,6 @@ class PayrollApp(QWidget):
         self.conn.commit()
 
         self.filter_employee_select.setCurrentIndex(0)
-        self.employee_search_input.clear()
         monthly_index = self.monthly_employee_select.findData(employee_id)
         if monthly_index >= 0:
             self.monthly_employee_select.blockSignals(True)
@@ -1151,20 +1238,24 @@ class PayrollApp(QWidget):
             self.monthly_summary_label.setText("Έλεγξε μήνα και έτος.")
             return
         if employee_id is None:
+            self.monthly_total_value.setText("—")
+            self.monthly_paid_value.setText("—")
+            self.monthly_due_value.setText("—")
             self.monthly_summary_label.setText("Πρόσθεσε ή επίλεξε υπάλληλο για μηνιαία σύνοψη.")
             return
         payroll = self.calculate_monthly_payroll(employee_id, year, month)
         self.monthly_paid_hours_input.setText(str(payroll["paid_hours"]))
         self.monthly_hourly_rate_input.setText(str(payroll["hourly_rate"]))
+        self.monthly_total_value.setText(f"{payroll['gross_pay']:.2f} €")
+        self.monthly_paid_value.setText(f"{payroll['total_paid_amount']:.2f} €")
+        self.monthly_due_value.setText(f"{payroll['amount_due']:.2f} €")
         self.monthly_summary_label.setText(
-            f"Σύνολο μισθοδοσίας: {payroll['gross_pay']:.2f} € | "
-            f"Πληρωμένο ποσό: {payroll['total_paid_amount']:.2f} € "
-            f"(δόσεις: {payroll['cash_payments']:.2f} €) | "
-            f"Πραγματικές ώρες: {payroll['actual_hours']:.2f} | "
-            f"Πληρωμένες ώρες: {payroll['paid_equivalent_hours']:.2f} | "
-            f"Υπόλοιπο: {payroll['outstanding_hours']:.2f} ώρες | Ωρομίσθιο: {payroll['hourly_rate']:.2f} € | "
+            f"{payroll['actual_hours']:.2f} πραγματικές ώρες · "
+            f"{payroll['paid_equivalent_hours']:.2f} πληρωμένες ώρες · "
+            f"{payroll['outstanding_hours']:.2f} ώρες υπόλοιπο · "
+            f"ωρομίσθιο {payroll['hourly_rate']:.2f} € · "
             f"Οφειλόμενο: {payroll['amount_due']:.2f} €" +
-            (f" | Επιπλέον πληρωμένα: {payroll['extra_paid_amount']:.2f} €" if payroll['extra_paid_amount'] else "")
+            (f" · Επιπλέον πληρωμένα: {payroll['extra_paid_amount']:.2f} €" if payroll['extra_paid_amount'] else "")
         )
 
     def add_monthly_payment(self):
@@ -1202,7 +1293,6 @@ class PayrollApp(QWidget):
         self.result_label.setText("Η επεξεργασία ακυρώθηκε")
 
     def clear_filters(self):
-        self.employee_search_input.clear()
         self.filter_employee_select.setCurrentIndex(0)
         self.from_date_input.setDate(QDate.currentDate().addMonths(-1))
         self.to_date_input.setDate(QDate.currentDate())
@@ -1311,7 +1401,9 @@ class PayrollApp(QWidget):
 
     def get_filtered_records(self):
         employee_id = self.filter_employee_select.currentData()
-        search = self.employee_search_input.text().strip()
+        search = ""
+        if employee_id is None and self.filter_employee_select.currentIndex() != 0:
+            search = self.filter_employee_select.currentText().strip()
 
         from_date = self.from_date_input.date().toString("yyyy-MM-dd")
         to_date = self.to_date_input.date().toString("yyyy-MM-dd")
@@ -1331,8 +1423,7 @@ class PayrollApp(QWidget):
         if employee_id is not None:
             query += " AND attendance.employee_id = ?"
             params.append(employee_id)
-
-        if search:
+        elif search and search != "Όλοι οι υπάλληλοι":
             query += " AND employees.name LIKE ?"
             params.append(f"%{search}%")
 
@@ -1349,8 +1440,13 @@ class PayrollApp(QWidget):
 
         totals = {}
         total_hours_sum = 0.0
-        month = int(self.monthly_month_select.currentData())
-        year = int(self.monthly_year_input.text())
+        try:
+            month = int(self.monthly_month_select.currentData())
+            year = int(self.monthly_year_input.text().strip())
+        except (ValueError, TypeError):
+            self.employee_summary_table.clearContents()
+            self.employee_summary_table.setRowCount(0)
+            return
 
         for row, record in enumerate(records):
             employee = record[1]
@@ -1366,9 +1462,7 @@ class PayrollApp(QWidget):
 
         self.history_table.resizeColumnsToContents()
 
-        self.summary_label.setText(
-            f"Σύνολα περιόδου\nΠραγματικές ώρες εργασίας: {total_hours_sum:.2f}"
-        )
+        self.summary_label.setText(f"Πραγματικές ώρες στην περίοδο: {total_hours_sum:.2f}")
 
         self.employee_summary_table.clearContents()
         self.employee_summary_table.setRowCount(len(totals))
@@ -1384,6 +1478,8 @@ class PayrollApp(QWidget):
 
             for col, value in enumerate(row_values):
                 item = QTableWidgetItem(value)
+                if col == 0:
+                    item.setData(Qt.UserRole, employee_id)
                 self.employee_summary_table.setItem(row, col, item)
 
         self.employee_summary_table.resizeColumnsToContents()

@@ -29,6 +29,14 @@ jobs:
       - name: Build Windows application
         run: python -m PyInstaller --noconfirm --clean --onefile --windowed --name PrometheusPayroll --icon PrometheusPayroll.ico --collect-all PySide6 --collect-all matplotlib app.py
 
+      - name: Build portable Windows folder
+        shell: pwsh
+        run: |
+          python -m PyInstaller --noconfirm --clean --onedir --windowed --name PrometheusPayroll --icon PrometheusPayroll.ico --collect-all PySide6 --collect-all matplotlib --distpath dist/portable --workpath build/portable app.py
+          New-Item -ItemType File -Path "dist/portable/PrometheusPayroll/portable.mode" | Out-Null
+          Set-Content -Path "dist/portable/PrometheusPayroll/README-PORTABLE.txt" -Value @("Prometheus Payroll portable version", "Run PrometheusPayroll.exe from this folder.", "The database is saved as payroll.db in this same folder.", "Keep this folder in a location where your Windows account can write files.", "Back up payroll.db before replacing or moving this folder.")
+          Compress-Archive -Path "dist/portable/PrometheusPayroll/*" -DestinationPath "dist/PrometheusPayroll-Portable-Windows.zip" -CompressionLevel Optimal
+
       - name: Create installer
         shell: pwsh
         run: |
@@ -48,5 +56,13 @@ jobs:
         with:
           name: PrometheusPayroll-Windows-Installer
           path: dist/PrometheusPayroll-Setup-1.1.2.exe
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload portable Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: PrometheusPayroll-Windows-Portable
+          path: dist/PrometheusPayroll-Portable-Windows.zip
           if-no-files-found: error
           retention-days: 14

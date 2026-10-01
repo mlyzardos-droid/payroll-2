@@ -29,11 +29,15 @@ from PySide6.QtWidgets import (
 
 
 if sys.platform == "win32":
-    APP_DATA_ROOT = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+    portable_marker = os.path.join(os.path.dirname(sys.executable), "portable.mode")
+    if getattr(sys, "frozen", False) and os.path.isfile(portable_marker):
+        # Portable builds keep their database beside the executable so the folder can move as a unit.
+        APP_DATA_DIR = os.path.dirname(sys.executable)
+    else:
+        APP_DATA_ROOT = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+        APP_DATA_DIR = os.path.join(APP_DATA_ROOT, "PrometheusPayroll")
 else:
-    APP_DATA_ROOT = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
-
-APP_DATA_DIR = os.path.join(APP_DATA_ROOT, "PrometheusPayroll")
+    APP_DATA_DIR = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "PrometheusPayroll")
 
 os.makedirs(APP_DATA_DIR, exist_ok=True)
 
